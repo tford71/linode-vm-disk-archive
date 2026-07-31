@@ -1,0 +1,50 @@
+usage: linode_vm_disk_archive.py <command> [options]
+
+Archive or restore a Linode VM's local boot disk through Block Storage.
+
+Commands:
+  archive            Create and verify an archive Block Storage volume.
+  restore            Create and boot a new VM from an archive.
+
+Advanced commands:
+  verify-archive     Compare an archive to a preserved source VM.
+  plan-resize        Read-only qualification for a minimum-size ext4 archive.
+  recover-resize     Re-expand a source after an interrupted minimum-size archive.
+  prepare-bsv-helper Prebuild the reusable helper volume for a region.
+
+General options:
+  -h, --help                  Show this help message and exit.
+  --version                   Show the program version.
+  --config CONFIG_FILE        JSON configuration file and path (default: ./config.json).
+
+archive options:
+  --linode-id LINODE_ID       Source VM ID. Required unless --linode-label is used.
+  --linode-label LABEL        Exact, unique source VM label. Alternative to --linode-id.
+  --archive-name NAME         Archive Block Storage volume name; default: <source>-archive.
+  --resize {original,min}     original preserves full local-disk size (default); min compacts a
+                              supported whole-device ext4 Linux root before archiving.
+  --delete-source             Delete source only after verification and a separate exact confirmation.
+  --dry-run                   Inspect source and proposed ordinary archive sizing; no VM or BSV changes.
+
+restore options:
+  --archive-name NAME         Archive BSV name. Required unless --volume-id is used.
+  --volume-id VOLUME_ID       Archive BSV ID. Alternative to --archive-name.
+  --new-vm-name NAME          Restored VM name; default: <source>-rN.
+  --restore-plan PLAN         Restored VM plan; default: archived source plan.
+  --restore-size {original,min,custom}
+                              Compact archives only: original expands to the original root allocation
+                              (default); min retains compact size; custom prompts for MB after plan selection.
+  --restore-verification {auto,full}
+                              auto hashes restored disk against archive tag (default); full hashes both disks.
+  --dry-run                   Validate archive and explicit --restore-plan without creating a VM.
+
+Examples:
+  python3 linode_vm_disk_archive.py archive --linode-label my-vm --resize min
+      Creates my-vm-archive, using the minimum supported ext4 root size when eligible.
+  python3 linode_vm_disk_archive.py restore --archive-name my-vm-archive
+      Creates my-vm-r1 and restores a compact archive to its original root allocation.
+
+Notes:
+  archive and restore automatically create and boot-test a reusable 10 GB helper BSV when absent.
+  The archive includes the selected local root disk. One separate local swap disk is recorded and
+  recreated blank with its original UUID. Attached Block Storage and additional local disks are not copied.
