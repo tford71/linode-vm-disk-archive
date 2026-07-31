@@ -21,10 +21,10 @@ archive options:
   --linode-id LINODE_ID       Source VM ID. Required unless --linode-label is used.
   --linode-label LABEL        Exact, unique source VM label. Alternative to --linode-id.
   --archive-name NAME         Archive Block Storage volume name; default: <source>-archive.
-  --resize {original,min}     original preserves full local-disk size (default); min compacts a
-                              supported whole-device ext4 Linux root before archiving.
+  --resize {min,original}     min compacts a supported whole-device ext4 Linux root before
+                              archiving (default); original preserves the full local-disk size.
   --delete-source             Delete source only after verification and a separate exact confirmation.
-  --dry-run                   Inspect source and proposed ordinary archive sizing; no VM or BSV changes.
+  --dry-run                   Inspect source and full-size fallback sizing; no VM or BSV changes.
 
 restore options:
   --archive-name NAME         Archive BSV name. Required unless --volume-id is used.
@@ -39,7 +39,7 @@ restore options:
   --dry-run                   Validate archive and explicit --restore-plan without creating a VM.
 
 Examples:
-  python3 linode_vm_disk_archive.py archive --linode-label my-vm --resize min
+  python3 linode_vm_disk_archive.py archive --linode-label my-vm
       Creates my-vm-archive, using the minimum supported ext4 root size when eligible.
   python3 linode_vm_disk_archive.py restore --archive-name my-vm-archive
       Creates my-vm-r1 and restores a compact archive to its original root allocation.

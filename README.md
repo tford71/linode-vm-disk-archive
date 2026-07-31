@@ -2,8 +2,8 @@
 
 `linode_vm_disk_archive.py` archives a Linode VM's selected local boot disk to
 a verified Block Storage volume (BSV), then restores it to a new Linode. It
-uses a small reusable Debian helper BSV to perform raw copies, checksums, and,
-when requested, supported Linux ext4 filesystem resizing.
+uses a small reusable Debian helper BSV to perform raw copies, checksums, and
+supported Linux ext4 filesystem resizing.
 
 The controller runs on any machine with Python 3 and an OpenSSH client: Linux,
 macOS, Windows with a suitable Python/SSH environment, a management VM, or
@@ -28,10 +28,8 @@ WSL. It is not WSL-specific.
 
 ## Archive modes
 
-By default, archive copies the full root local disk.
-
-`--resize min` is an opt-in compact archive mode for a proven whole-device
-Linux `ext4` root filesystem. It powers off the source, determines the minimum
+By default, archive uses compact mode for a proven whole-device Linux `ext4`
+root filesystem. It powers off the source, determines the minimum
 filesystem size, adds a 4 GB safety buffer, temporarily shrinks the source
 filesystem and local disk, and archives the smaller disk. After a successful
 archive, the source is restored to its original disk allocation and filesystem
@@ -39,6 +37,7 @@ size unless `--delete-source` was explicitly requested.
 
 Windows, partitioned roots, and unsupported filesystems are never shrunk. The
 tool explains why and offers to continue with an ordinary full-size archive.
+Use `--resize original` when you explicitly want an ordinary full-size archive.
 
 ## Requirements
 
@@ -66,7 +65,7 @@ library and the system OpenSSH client.
 ```bash
 # Archive a VM. The first archive or restore in a region automatically creates
 # and independently boot-tests the reusable 10 GB helper BSV.
-python3 linode_vm_disk_archive.py archive --linode-label my-vm --resize min
+python3 linode_vm_disk_archive.py archive --linode-label my-vm
 
 # Restore with the archived source plan and, for a compact archive, the
 # original root allocation. The default name is my-vm-r1, then my-vm-r2, etc.

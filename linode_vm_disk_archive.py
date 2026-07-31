@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Experimental Version 2.0 beta: archive and restore Linode local boot disks.
+"""Archive and restore Linode local boot disks through Block Storage.
 
-The opt-in ``archive --resize min`` path supports carefully constrained
-whole-device ext4 compact archives. Version 1.0 remains the production path.
+Archive defaults to a carefully constrained whole-device ext4 compact archive
+when the source qualifies. Unsupported roots fall back to an ordinary archive
+only after the operator confirms that choice.
 """
 
 import argparse
@@ -793,7 +794,7 @@ def run_active_cleanups():
         except Exception: pass
 
 def archive_plan_bsv(api, c):
-    """Read-only archive preflight."""
+    """Read-only ordinary-archive preflight."""
     node = api.get(f"/linode/instances/{c['source_linode_id']}")
     root = source_root_disk(api, c, node["id"])
     print(json.dumps({"source": {"id": node["id"], "label": node["label"], "region": node["region"], "plan": node["type"]}, "root_disk": {"id": root["id"], "size_mb": root["size"]}, "archive_volume_gb": math.ceil(root["size"] / 1024), "will_delete_source": bool(c.get("delete_source"))}, indent=2))
@@ -1592,10 +1593,10 @@ def main():
                 "  --linode-id LINODE_ID       Source VM ID. Required unless --linode-label is used.\n"
                 "  --linode-label LABEL        Exact, unique source VM label. Alternative to --linode-id.\n"
                 "  --archive-name NAME         Archive Block Storage volume name; default: <source>-archive.\n"
-                "  --resize {original,min}     original preserves full local-disk size (default); min compacts a\n"
-                "                              supported whole-device ext4 Linux root before archiving.\n"
+                "  --resize {min,original}     min compacts a supported whole-device ext4 Linux root before\n"
+                "                              archiving (default); original preserves the full local-disk size.\n"
                 "  --delete-source             Delete source only after verification and a separate exact confirmation.\n"
-                "  --dry-run                   Inspect source and proposed ordinary archive sizing; no VM or BSV changes.\n\n"
+                "  --dry-run                   Inspect source and full-size fallback sizing; no VM or BSV changes.\n\n"
                 "restore options:\n"
                 "  --archive-name NAME         Archive BSV name. Required unless --volume-id is used.\n"
                 "  --volume-id VOLUME_ID       Archive BSV ID. Alternative to --archive-name.\n"
@@ -1608,7 +1609,7 @@ def main():
                 "                              auto hashes restored disk against archive tag (default); full hashes both disks.\n"
                 "  --dry-run                   Validate archive and explicit --restore-plan without creating a VM.\n\n"
                 "Examples:\n"
-                "  python3 linode_vm_disk_archive.py archive --linode-label my-vm --resize min\n"
+                "  python3 linode_vm_disk_archive.py archive --linode-label my-vm\n"
                 "      Creates my-vm-archive, using the minimum supported ext4 root size when eligible.\n"
                 "  python3 linode_vm_disk_archive.py restore --archive-name my-vm-archive\n"
                 "      Creates my-vm-r1 and restores a compact archive to its original root allocation.\n\n"
@@ -1625,7 +1626,7 @@ def main():
     parser.add_argument("--linode-id", metavar="LINODE_ID", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--linode-label", metavar="LABEL", help=argparse.SUPPRESS)
     parser.add_argument("--delete-source", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--resize", choices=["original", "min"], default="original", help=argparse.SUPPRESS)
+    parser.add_argument("--resize", choices=["original", "min"], default="min", help=argparse.SUPPRESS)
     parser.add_argument("--archive-name", metavar="ARCHIVE_NAME", help=argparse.SUPPRESS)
     parser.add_argument("--volume-id", metavar="VOLUME_ID", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--restore-plan", metavar="PLAN", help=argparse.SUPPRESS)
@@ -1643,8 +1644,6 @@ def main():
             parser.error("--dry-run is available only with archive or restore")
         if args.delete_source:
             parser.error("--dry-run cannot be combined with --delete-source")
-        if args.command == "archive" and args.resize == "min":
-            parser.error("--dry-run cannot calculate a minimum ext4 size without booting the helper; use plan-resize instead")
         if args.command == "restore" and not args.restore_plan:
             parser.error("restore --dry-run requires an explicit --restore-plan")
     if args.linode_id and args.linode_label:

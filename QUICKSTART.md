@@ -69,21 +69,16 @@ The simplest archive command uses the source VM's exact label:
 python3 linode_vm_disk_archive.py archive --linode-label my-vm
 ```
 
-It creates `my-vm-archive`, copies the full local root disk, checksum-verifies
-the copy, and leaves the source VM powered off.
+For a supported whole-device Linux `ext4` root, this measures the filesystem,
+adds a 4 GB safety buffer, and creates the smallest supported archive BSV.
+After verification, the source root disk and filesystem return to their
+original size and the source remains powered off.
 
-For a supported whole-device Linux `ext4` root that is mostly empty, use a
-compact archive:
+If you explicitly want a full-size archive, add `--resize original`:
 
 ```bash
-python3 linode_vm_disk_archive.py archive \
-  --linode-label my-vm \
-  --resize min
+python3 linode_vm_disk_archive.py archive --linode-label my-vm --resize original
 ```
-
-This measures the filesystem, adds a 4 GB safety buffer, and creates the
-smallest supported archive BSV. After verification, the source root disk and
-filesystem return to their original size and the source remains powered off.
 If the root cannot be safely shrunk, such as Windows or a partitioned root, the
 tool offers a normal full-size archive instead.
 
