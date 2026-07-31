@@ -39,10 +39,6 @@ RESIZE_SAFETY_BUFFER_MB = 4096
 # archive BSV must still meet the provider's minimum.
 MINIMUM_BSV_SIZE_GB = 10
 
-# The API's local-disk allocation can be slightly larger than the raw block
-# device it presents to a guest. Keep an explicit allowance when sizing an
-# ext4 filesystem inside a newly reduced local disk.
-COMPACT_RAW_DEVICE_ALLOWANCE_MB = FRESH_DISK_UNDERSIZE_MB
 VOLUME_LABEL_MAX = 32
 LINODE_LABEL_MAX = 64
 
@@ -333,14 +329,15 @@ estimate=$(resize2fs -P "$source" 2>&1) || { printf '{"ok":true,"supported":fals
 minimum_blocks=$(printf '%s\n' "$estimate" | sed -n 's/.*: \([0-9][0-9]*\)$/\1/p' | tail -n 1)
 block_size=$(tune2fs -l "$source" 2>/dev/null | awk -F: '/^Block size:/{gsub(/ /,"",$2); print $2}')
 block_count=$(tune2fs -l "$source" 2>/dev/null | awk -F: '/^Block count:/{gsub(/ /,"",$2); print $2}')
+blocks_per_group=$(tune2fs -l "$source" 2>/dev/null | awk -F: '/^Blocks per group:/{gsub(/ /,"",$2); print $2}')
 uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
 [ -n "$uuid" ] || fail "could not parse ext4 filesystem UUID"
-case "$minimum_blocks:$block_size:$block_count" in
+case "$minimum_blocks:$block_size:$block_count:$blocks_per_group" in
   *[!0-9:]*|::*|:*|*:) fail "could not parse numeric ext4 block metrics" ;;
 esac
 minimum_bytes=$((minimum_blocks * block_size))
 filesystem_bytes=$((block_count * block_size))
-printf '{"ok":true,"supported":true,"source_device":"%s","raw_bytes":%s,"filesystem":"ext4","layout":"whole-device","ext4_uuid":"%s","ext4_block_size":%s,"ext4_block_count":%s,"ext4_filesystem_bytes":%s,"ext4_minimum_blocks":%s,"ext4_minimum_bytes":%s}\n' "$source" "$raw_bytes" "$uuid" "$block_size" "$block_count" "$filesystem_bytes" "$minimum_blocks" "$minimum_bytes"'''
+printf '{"ok":true,"supported":true,"source_device":"%s","raw_bytes":%s,"filesystem":"ext4","layout":"whole-device","ext4_uuid":"%s","ext4_block_size":%s,"ext4_block_count":%s,"ext4_blocks_per_group":%s,"ext4_filesystem_bytes":%s,"ext4_minimum_blocks":%s,"ext4_minimum_bytes":%s}\n' "$source" "$raw_bytes" "$uuid" "$block_size" "$block_count" "$blocks_per_group" "$filesystem_bytes" "$minimum_blocks" "$minimum_bytes"'''
     result = ssh(c, ip, f"/bin/bash -c {shlex.quote(inspector)} -- {shlex.quote(helper_volume_label)}")
     if result.returncode != 0:
         raise RuntimeError("Resize inspection SSH command failed: " + (result.stderr.strip() or result.stdout.strip()))
@@ -425,14 +422,13 @@ def plan_resize(api, c):
     inspection["source_api_allocation_mb"] = root["size"]
     inspection["safety_buffer_mb"] = RESIZE_SAFETY_BUFFER_MB
     if inspection.get("supported"):
-        minimum_mb = math.ceil(int(inspection["ext4_minimum_bytes"]) / (1024 * 1024))
-        calculated_compact_mb = math.ceil((minimum_mb + RESIZE_SAFETY_BUFFER_MB) / 1024) * 1024
-        compact_bsv_gb = max(MINIMUM_BSV_SIZE_GB, calculated_compact_mb // 1024)
-        inspection["ext4_minimum_mb"] = minimum_mb
-        inspection["calculated_compact_root_mb"] = calculated_compact_mb
+        sizes = compact_resize_sizes(inspection)
+        inspection["ext4_minimum_mb"] = sizes["ext4_minimum_mb"]
+        inspection["requested_ext4_shrink_mb"] = sizes["requested_filesystem_mb"]
+        inspection["estimated_aligned_ext4_mb"] = sizes["estimated_aligned_filesystem_mb"]
+        inspection["estimated_compact_root_mb"] = sizes["estimated_compact_api_mb"]
         inspection["provider_minimum_bsv_gb"] = MINIMUM_BSV_SIZE_GB
-        inspection["proposed_compact_root_mb"] = compact_bsv_gb * 1024
-        inspection["proposed_archive_bsv_gb"] = compact_bsv_gb
+        inspection["estimated_archive_bsv_gb"] = sizes["estimated_archive_bsv_gb"]
         milestone("Resize qualification passed; no filesystem changes were made")
     else:
         milestone("Resize qualification did not support this root layout; no filesystem changes were made")
@@ -982,19 +978,41 @@ def print_matching_hashes(result, source_label, destination_label):
     print(f"SHA-256 {destination_label}: {destination_hash}")
 
 def compact_resize_sizes(inspection):
-    """Return safe API/filesystem/BSV sizes from a successful inspection."""
+    """Return the initial ext4 shrink target from a successful inspection.
+
+    ext4 may round this target upward to an allocation-group boundary.  The
+    resulting filesystem is measured after resize2fs and only then used to
+    size the compact local disk and whole-GB archive BSV.
+    """
     minimum_mb = math.ceil(int(inspection["ext4_minimum_bytes"]) / (1024 * 1024))
-    calculated_allocation_mb = math.ceil((minimum_mb + RESIZE_SAFETY_BUFFER_MB) / 1024) * 1024
-    compact_api_mb = max(MINIMUM_BSV_SIZE_GB * 1024, calculated_allocation_mb)
-    compact_fs_mb = compact_api_mb - COMPACT_RAW_DEVICE_ALLOWANCE_MB
-    if compact_fs_mb < minimum_mb + RESIZE_SAFETY_BUFFER_MB:
-        raise RuntimeError("The compact local-disk allocation cannot hold the ext4 minimum plus safety buffer.")
+    block_size = int(inspection["ext4_block_size"])
+    blocks_per_group = int(inspection["ext4_blocks_per_group"])
+    requested_filesystem_mb = minimum_mb + RESIZE_SAFETY_BUFFER_MB
+    requested_blocks = math.ceil(requested_filesystem_mb * 1024 * 1024 / block_size)
+    aligned_blocks = math.ceil(requested_blocks / blocks_per_group) * blocks_per_group
+    aligned_filesystem_bytes = aligned_blocks * block_size
+    final_sizes = compact_disk_sizes_from_filesystem(aligned_filesystem_bytes)
     return {
         "ext4_minimum_mb": minimum_mb,
-        "calculated_compact_root_mb": calculated_allocation_mb,
+        "requested_filesystem_mb": requested_filesystem_mb,
+        "estimated_aligned_filesystem_mb": final_sizes["compact_filesystem_mb"],
+        "estimated_compact_api_mb": final_sizes["compact_api_mb"],
+        "estimated_archive_bsv_gb": final_sizes["archive_bsv_gb"],
+    }
+
+def compact_disk_sizes_from_filesystem(filesystem_bytes):
+    """Size a compact source disk and BSV from the actual resized ext4 size."""
+    filesystem_mb = math.ceil(int(filesystem_bytes) / (1024 * 1024))
+    # A locally resized disk can expose up to 16 MiB less raw capacity than
+    # requested. Use the established 32 MiB cushion so the measured ext4
+    # filesystem always fits. The BSV itself is then rounded up to its whole
+    # GB provider increment, with the provider's 10 GB minimum.
+    compact_api_mb = filesystem_mb + LOCAL_DISK_CUSHION_MB
+    archive_bsv_gb = max(MINIMUM_BSV_SIZE_GB, math.ceil(compact_api_mb / 1024))
+    return {
+        "compact_filesystem_mb": filesystem_mb,
         "compact_api_mb": compact_api_mb,
-        "compact_filesystem_mb": compact_fs_mb,
-        "archive_bsv_gb": compact_api_mb // 1024,
+        "archive_bsv_gb": archive_bsv_gb,
     }
 
 def reexpand_source_root(api, c, node_id, root, helper, swap_source=None, baseline=None):
@@ -1135,29 +1153,38 @@ def archive_bsv_resize_min(api, c):
             )
             return
         validate_resize_root(inspection, root["size"], "read-only source qualification")
-        sizes = compact_resize_sizes(inspection)
-        print(json.dumps({"filesystem_minimum_mb": sizes["ext4_minimum_mb"], "safety_buffer_mb": RESIZE_SAFETY_BUFFER_MB,
-                          "compact_source_disk_mb": sizes["compact_api_mb"], "compact_ext4_mb": sizes["compact_filesystem_mb"],
-                          "archive_bsv_gb": sizes["archive_bsv_gb"], "original_source_disk_mb": root["size"]}, indent=2))
+        shrink_target = compact_resize_sizes(inspection)
+        print(json.dumps({
+            "filesystem_minimum_mb": shrink_target["ext4_minimum_mb"],
+            "safety_buffer_mb": RESIZE_SAFETY_BUFFER_MB,
+            "requested_ext4_shrink_mb": shrink_target["requested_filesystem_mb"],
+            "estimated_aligned_ext4_mb": shrink_target["estimated_aligned_filesystem_mb"],
+            "estimated_compact_source_disk_mb": shrink_target["estimated_compact_api_mb"],
+            "estimated_archive_bsv_gb": shrink_target["estimated_archive_bsv_gb"],
+            "original_source_disk_mb": root["size"],
+        }, indent=2))
+        milestone("Checking and shrinking detached source ext4 filesystem")
+        # e2fsck may repair metadata before resize2fs returns; from this point
+        # forward an error path must run the source re-expansion safeguard.
+        source_touched = True
+        resize_detached_ext4(c, node["ipv4"][0], inspection["source_device"], shrink_target["requested_filesystem_mb"])
+        post_shrink = inspect_resize_candidate(c, node["ipv4"][0], helper["label"])
+        validate_resize_root(
+            post_shrink, root["size"], "post-shrink source check",
+            expected_uuid=inspection["ext4_uuid"],
+        )
+        if int(post_shrink["ext4_filesystem_bytes"]) < shrink_target["requested_filesystem_mb"] * 1024 * 1024:
+            raise RuntimeError("post-shrink source check: ext4 filesystem is smaller than the requested minimum-plus-buffer size.")
+        sizes = compact_disk_sizes_from_filesystem(post_shrink["ext4_filesystem_bytes"])
         source_after_verification = (
             "delete the source VM after a final exact confirmation"
             if c.get("delete_source")
             else "restore the source disk and filesystem to their original size"
         )
         milestone(
-            f"Compact size qualified: root {sizes['compact_api_mb']} MB; archive BSV {sizes['archive_bsv_gb']} GB. "
-            f"The workflow will now shrink, archive, then {source_after_verification}."
-        )
-        milestone("Checking and shrinking detached source ext4 filesystem")
-        # e2fsck may repair metadata before resize2fs returns; from this point
-        # forward an error path must run the source re-expansion safeguard.
-        source_touched = True
-        resize_detached_ext4(c, node["ipv4"][0], inspection["source_device"], sizes["compact_filesystem_mb"])
-        post_shrink = inspect_resize_candidate(c, node["ipv4"][0], helper["label"])
-        validate_resize_root(
-            post_shrink, root["size"], "post-shrink source check",
-            expected_uuid=inspection["ext4_uuid"],
-            maximum_filesystem_bytes=sizes["compact_filesystem_mb"] * 1024 * 1024,
+            f"Compact size qualified after ext4 alignment: filesystem {sizes['compact_filesystem_mb']} MB; "
+            f"source root {sizes['compact_api_mb']} MB; archive BSV {sizes['archive_bsv_gb']} GB. "
+            f"The workflow will now archive, then {source_after_verification}."
         )
         shutdown(api, node["id"])
         detach_volume_and_wait(api, helper['id'], "helper BSV")
