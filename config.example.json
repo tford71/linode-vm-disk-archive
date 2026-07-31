@@ -1,0 +1,7 @@
+{
+  "archive_directory": "./archives",
+  "helper_image": "linode/debian13",
+  "helper_ssh_public_key": "ssh-ed25519 AAAA... linode-vm-disk-archive-automation",
+  "helper_ssh_private_key": "/home/<your-user>/.ssh/linode-vm-disk-archive-automation",
+  "copy_timeout_seconds": 86400
+}
