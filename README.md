@@ -36,8 +36,8 @@ archive, the source is restored to its original disk allocation and filesystem
 size unless `--delete-source` was explicitly requested.
 
 Windows, partitioned roots, and unsupported filesystems are never shrunk. The
-tool explains why and offers to continue with an ordinary full-size archive.
-Use `--resize original` when you explicitly want an ordinary full-size archive.
+tool explains why, creates no archive, and leaves the source unchanged. Rerun
+with `--resize original` when you explicitly want an ordinary full-size archive.
 
 ## Requirements
 

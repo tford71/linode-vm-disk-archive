@@ -80,7 +80,8 @@ If you explicitly want a full-size archive, add `--resize original`:
 python3 linode_vm_disk_archive.py archive --linode-label my-vm --resize original
 ```
 If the root cannot be safely shrunk, such as Windows or a partitioned root, the
-tool offers a normal full-size archive instead.
+tool explains why, creates no archive, and leaves the source unchanged. Rerun
+with `--resize original` for a normal full-size archive.
 
 The first archive or restore in a region automatically creates and boot-tests a
 reusable 10 GB helper BSV. Running `prepare-bsv-helper` separately is optional.

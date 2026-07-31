@@ -385,13 +385,13 @@ def validate_resize_root(inspection, expected_api_mb, stage, expected_uuid=None,
     return inspection
 
 def plan_resize(api, c):
-    """Read-only qualification for an opt-in ext4 shrink archive."""
+    """Read-only qualification for a minimum-size ext4 archive."""
     node = api.get(f"/linode/instances/{c['source_linode_id']}")
     boot_config = source_boot_config(api, c, node["id"])
     root = source_root_disk(api, c, node["id"], boot_config)
     swap_source = source_swap_disk(api, node["id"], boot_config, root)
     summary = (
-        "This beta inspection will power off the source VM, boot the reusable helper, "
+        "This read-only inspection will power off the source VM, boot the reusable helper, "
         "and inspect the detached root filesystem. It will not run e2fsck, resize2fs, "
         "or create an archive BSV. The source VM will remain powered off when complete.\n\n"
         f"Source: {node['label']} (Linode {node['id']})\n"
@@ -399,9 +399,11 @@ def plan_resize(api, c):
     )
     if swap_source:
         summary += f"Separate swap: {swap_source['disk']['size']} MB\n"
+    if helper_creation_needed(api, node["region"]):
+        summary += "\n" + helper_creation_summary(c, node["region"]) + "\n"
     print(summary, flush=True)
     require_yes(f"INSPECT RESIZE {node['id']}")
-    helper = helper_boot_volume(api, c, node["region"])
+    helper = helper_boot_volume(api, c, node["region"], confirm_create=False)
     shutdown(api, node["id"])
     config = create_config(
         api, node["id"], "cold-archive-v2-resize-inspect",
@@ -800,6 +802,22 @@ def archive_plan_bsv(api, c):
     print(json.dumps({"source": {"id": node["id"], "label": node["label"], "region": node["region"], "plan": node["type"]}, "root_disk": {"id": root["id"], "size_mb": root["size"]}, "archive_volume_gb": math.ceil(root["size"] / 1024), "will_delete_source": bool(c.get("delete_source"))}, indent=2))
     return node, root
 
+def helper_creation_needed(api, region):
+    """Read-only check for whether a compatible regional helper is absent."""
+    volumes = api.get("/volumes?page=1&page_size=100")["data"]
+    return not any(
+        volume.get("region") == region
+        and any(tag in COMPATIBLE_HELPER_READY_TAGS for tag in volume.get("tags", []))
+        for volume in volumes
+    )
+
+def helper_creation_summary(c, region):
+    size = int(c.get("helper_boot_volume_gb", 10))
+    return (
+        f"It will also create and boot-test a reusable {size} GB VM archive helper BSV in {region}.\n"
+        "That helper is retained for future archive and restore operations in this region."
+    )
+
 def prepare_bsv_helper(api, c):
     """Build and retain the regional helper BSV; no source/archive data moves."""
     source = api.get(f"/linode/instances/{c['source_linode_id']}")
@@ -1023,13 +1041,15 @@ def recover_resize_source(api, c):
     root = source_root_disk(api, c, node["id"], boot_config)
     swap_source = source_swap_disk(api, node["id"], boot_config, root)
     print(
-        "This beta recovery will power off the source VM, boot the reusable helper, "
+        "This recovery will power off the source VM, boot the reusable helper, "
         f"and re-expand a supported detached ext4 root to its current {root['size']} MB local disk. "
         "It will not create an archive volume. The source VM will remain powered off when complete.",
         flush=True,
     )
+    if helper_creation_needed(api, node["region"]):
+        print("\n" + helper_creation_summary(c, node["region"]), flush=True)
     require_yes(f"RECOVER ROOT {node['id']}")
-    helper = helper_boot_volume(api, c, node["region"])
+    helper = helper_boot_volume(api, c, node["region"], confirm_create=False)
     reexpand_source_root(api, c, node["id"], root, helper, swap_source)
     print("Source root recovery completed; its ext4 filesystem now fills the original local disk and the VM remains powered off.")
 
@@ -1050,13 +1070,15 @@ def archive_bsv_resize_min(api, c):
     existing = [v for v in api.get("/volumes?page=1&page_size=100")["data"] if v.get("region") == node["region"] and v.get("label") == c["archive_label"]]
     if existing:
         raise RuntimeError(f"An archive volume named {c['archive_label']!r} already exists in {node['region']}; choose another --archive-name.")
+    helper_needed = helper_creation_needed(api, node["region"])
     print(
-        "This beta workflow will temporarily shrink the detached whole-device ext4 root filesystem, "
+        "This workflow will temporarily shrink the detached whole-device ext4 root filesystem, "
         "then archive it.\n"
         "It is limited to a root local disk with an optional separate swap disk.\n\n"
         f"Source: {node['label']} (Linode {node['id']})\n"
         f"Original root allocation: {root['size']} MB\n"
-        f"Requested resize mode: min (ext4 minimum + {RESIZE_SAFETY_BUFFER_MB} MB buffer; provider BSV minimum {MINIMUM_BSV_SIZE_GB} GB)\n",
+        f"Requested resize mode: min (ext4 minimum + {RESIZE_SAFETY_BUFFER_MB} MB buffer; provider BSV minimum {MINIMUM_BSV_SIZE_GB} GB)\n"
+        + ("\n" + helper_creation_summary(c, node["region"]) if helper_needed else ""),
         flush=True,
     )
     if c.get("delete_source"):
@@ -1070,7 +1092,8 @@ def archive_bsv_resize_min(api, c):
         for slot, label, size in attached_volumes:
             suffix = f" ({size} GB)" if size is not None else ""
             print(f"  - /dev/{slot}: {label}{suffix}", flush=True)
-    helper = helper_boot_volume(api, c, node["region"])
+    require_yes(f"ARCHIVE {node['id']} AS {c['archive_label']}")
+    helper = helper_boot_volume(api, c, node["region"], confirm_create=False)
     initial_config = None
     copy_config = None
     archive_volume = None
@@ -1106,17 +1129,10 @@ def archive_bsv_resize_min(api, c):
             print(
                 "A minimum-size archive is unavailable for this source.\n"
                 f"Reason: {reason}.\n"
-                "This beta shrinks only a proven whole-device ext4 Linux root; Windows/NTFS and partitioned roots are intentionally not modified.\n"
-                "The source disk and filesystem were not changed.",
+                "Only a proven whole-device ext4 Linux root may be compacted; Windows/NTFS and partitioned roots are intentionally not modified.\n"
+                "The source disk and filesystem were not changed. Rerun with --resize original to create a full-size archive.",
                 flush=True,
             )
-            answer = input("Continue with an original-size archive instead? [Y/n]: ").strip().lower()
-            if answer not in ("", "y", "yes"):
-                print("No archive created. The source VM remains powered off.", flush=True)
-                return
-            milestone("Continuing with the normal original-size archive; no source resize will be performed")
-            c["resize_mode"] = "original"
-            archive_bsv(api, c)
             return
         validate_resize_root(inspection, root["size"], "read-only source qualification")
         sizes = compact_resize_sizes(inspection)
@@ -1128,12 +1144,10 @@ def archive_bsv_resize_min(api, c):
             if c.get("delete_source")
             else "restore the source disk and filesystem to their original size"
         )
-        print(
-            f"This will now shrink the source root to {sizes['compact_api_mb']} MB, create the "
-            f"{sizes['archive_bsv_gb']} GB archive BSV {c['archive_label']!r}, then {source_after_verification}.",
-            flush=True,
+        milestone(
+            f"Compact size qualified: root {sizes['compact_api_mb']} MB; archive BSV {sizes['archive_bsv_gb']} GB. "
+            f"The workflow will now shrink, archive, then {source_after_verification}."
         )
-        require_yes(f"COMPACT ARCHIVE {node['id']} AS {c['archive_label']} TO {sizes['compact_api_mb']} MB")
         milestone("Checking and shrinking detached source ext4 filesystem")
         # e2fsck may repair metadata before resize2fs returns; from this point
         # forward an error path must run the source re-expansion safeguard.
@@ -1249,6 +1263,7 @@ def archive_bsv(api, c):
     if duplicate_archive:
         raise RuntimeError(f"An archive volume named {c['archive_label']!r} already exists in {node['region']}; choose another --archive-name.")
     archive_gb = math.ceil(root["size"] / 1024)
+    helper_needed = helper_creation_needed(api, node["region"])
     source_outcome = (
         "The source VM will be powered off before copying, then deleted only after verification and a final confirmation."
         if c.get("delete_source")
@@ -1277,8 +1292,10 @@ def archive_bsv(api, c):
         f"{source_outcome}\n\n{inventory}",
         flush=True,
     )
+    if helper_needed:
+        print("\n" + helper_creation_summary(c, node["region"]), flush=True)
     require_yes(f"ARCHIVE {node['id']} AS {c['archive_label']}")
-    helper = helper_boot_volume(api, c, node["region"])
+    helper = helper_boot_volume(api, c, node["region"], confirm_create=False)
     shutdown(api, node["id"])
     milestone("Creating archive Block Storage volume")
     archive_volume = api.post("/volumes", {"label": c["archive_label"], "region": node["region"], "size": archive_gb, "tags": ["ca-archive-building-v1"]})
@@ -1332,7 +1349,7 @@ def archive_metadata_from_volume(api, volume_id):
     validate_archive_metadata_tags(tags)
     archive_format = single_ca_tag_value(tags, "ca-format-")
     if archive_format not in ("1", "2b1"):
-        raise RuntimeError("This controller accepts only ca-format-1 or Version 2 beta ca-format-2b1 archive volumes.")
+        raise RuntimeError("This controller accepts only ca-format-1 or ca-format-2b1 archive volumes.")
     def tagged(prefix):
         return single_ca_tag_value(tags, prefix)
     source_mb = tagged("ca-source-disk-mb-")
@@ -1362,14 +1379,14 @@ def archive_metadata_from_volume(api, volume_id):
         compact_mb = tagged("ca-resize-compact-mb-")
         buffer_mb = tagged("ca-resize-buffer-mb-")
         if "ca-resize-v1" not in tags or not all((resize_mode, resize_fs, resize_layout, original_mb, compact_mb, buffer_mb)):
-            raise RuntimeError("Version 2 beta archive has incomplete resize metadata tags.")
+            raise RuntimeError("Compact archive has incomplete resize metadata tags.")
         resize = {"mode": resize_mode, "filesystem": resize_fs, "layout": resize_layout,
                   "original_api_mb": int(original_mb), "compact_api_mb": int(compact_mb),
                   "safety_buffer_mb": int(buffer_mb)}
         if not source_label:
             label_one, label_two = tagged("ca-source-label1-"), tagged("ca-source-label2-")
             if not label_one or label_two is None:
-                raise RuntimeError("Version 2 beta archive is missing complete source-label metadata tags.")
+                raise RuntimeError("Compact archive is missing complete source-label metadata tags.")
             source_label = label_one + label_two
     if not source_label:
         raise RuntimeError("Archive volume is missing its source-label tag.")
@@ -1434,9 +1451,9 @@ def restore_bsv(api, c):
     target_mb = math.ceil(int(m["source_bytes"]) / (1024 * 1024))
     compact_floor = int((m.get("resize") or {}).get("compact_api_mb", 0))
     validate_linode_label(c["restore_label"])
-    # Build or validate the regional helper before creating a billable restored
-    # VM. A helper-build failure must not leave an otherwise empty target VM.
-    helper = helper_boot_volume(api, c, verify_archive_volume(api, m)["region"])
+    # Build the helper only after all restore choices have been confirmed, but
+    # still before creating a billable restored VM.
+    helper_needed = helper_creation_needed(api, verify_archive_volume(api, m)["region"])
     unavailable_plan_ids = set()
     while True:
         volume = choose_restore_plan(api, c, m, unavailable_plan_ids)
@@ -1458,7 +1475,10 @@ def restore_bsv(api, c):
             f"  Source archive volume: {m['volume_id']} ({volume['size']} GB)",
             flush=True,
         )
+        if helper_needed:
+            print("\n" + helper_creation_summary(c, volume["region"]), flush=True)
         require_yes(f"RESTORE {m['volume_id']} AS {c['restore_label']}")
+        helper = helper_boot_volume(api, c, volume["region"], confirm_create=False)
         milestone(f"Creating the restored Linode directly as {final['id']}")
         created_at = datetime.now(timezone.utc)
         try:
@@ -1554,7 +1574,18 @@ def verify_archive_bsv(api, c):
     archive_volume = verify_archive_volume(api, m)
     node = api.get(f"/linode/instances/{c['source_linode_id']}")
     root = source_root_disk(api, c, node["id"])
-    helper = helper_boot_volume(api, c, node["region"])
+    helper_needed = helper_creation_needed(api, node["region"])
+    print(
+        "This read-only verification will power off the source VM, boot the helper, and compare the "
+        "selected local root disk with the archive BSV. It does not modify either disk.\n\n"
+        f"Source: {node['label']} (Linode {node['id']})\n"
+        f"Archive BSV: {archive_volume['label']} (volume {archive_volume['id']}, {archive_volume['size']} GB)",
+        flush=True,
+    )
+    if helper_needed:
+        print("\n" + helper_creation_summary(c, node["region"]), flush=True)
+    require_yes(f"VERIFY ARCHIVE {archive_volume['id']} AGAINST LINODE {node['id']}")
+    helper = helper_boot_volume(api, c, node["region"], confirm_create=False)
     shutdown(api, node["id"])
     config = create_config(api, node["id"], "cold-archive-bsv-verify", {"volume_id": helper["id"]}, {"disk_id": root["id"]}, {"volume_id": archive_volume["id"]}, kernel="linode/grub2")
     ACTIVE_CLEANUPS.append(lambda: cleanup_bsv_session(api, node["id"], config["id"], [archive_volume["id"], helper["id"]]))
@@ -2044,7 +2075,7 @@ def wait_for_helper_worker(c, ip, timeout_seconds=120):
     suffix = f" Details: {last_detail}" if last_detail else ""
     raise RuntimeError("Helper BSV booted, but its copy worker did not become executable within 120 seconds." + suffix)
 
-def helper_boot_volume(api, c, region):
+def helper_boot_volume(api, c, region, confirm_create=True):
     volumes = api.get("/volumes?page=1&page_size=100")["data"]
     existing = [
         v for v in volumes
@@ -2072,12 +2103,13 @@ def helper_boot_volume(api, c, region):
             "The tool will not retag, replace, or reuse an unknown helper BSV."
         )
     size = int(c.get("helper_boot_volume_gb", 10))
-    print(
-        f"This will create a reusable {size} GB helper Block Storage volume in {region}.\n"
-        "It will also briefly create disposable builder and probe Linodes to install and boot-test it.",
-        flush=True,
-    )
-    require_yes(f"CREATE BSV HELPER IN {region}")
+    if confirm_create:
+        print(
+            f"This will create a reusable {size} GB helper Block Storage volume in {region}.\n"
+            "It will also briefly create disposable builder and probe Linodes to install and boot-test it.",
+            flush=True,
+        )
+        require_yes(f"CREATE BSV HELPER IN {region}")
     milestone(f"Stage 1/5: creating reusable {size} GB Debian helper BSV in {region}")
     volume = api.post("/volumes", {"label": helper_label, "region": region, "size": size,
                                    "tags": [BUILDING_TAG, f"ca-helper-region-{region}"]})
@@ -2090,15 +2122,15 @@ def helper_boot_volume(api, c, region):
         builder_type = types[0]["id"]
         milestone(f"Stage 2/5: creating disposable {builder_type} Debian builder")
         started = datetime.now(timezone.utc)
-        builder = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"vm-archive-helper-builder-{int(time.time())}"})
+        builder = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"vm-archive-builder-{int(time.time())}"})
         builder_id = builder["id"]
         builder = wait_for_linode_create(api, builder_id, started, "helper builder Linode")
         disk = post_when_linode_ready(api, f"/linode/instances/{builder_id}/disks", {
-            "label": "vm-archive-helper-builder", "size": 4096, "image": c["helper_image"],
+            "label": "vm-archive-builder", "size": 4096, "image": c["helper_image"],
             "authorized_keys": [c["helper_ssh_public_key"]], "stackscript_id": stack,
             "stackscript_data": {"TARGET_VOLUME_LABEL": volume["label"]},
         }, "create the helper builder disk")
-        config = create_config(api, builder_id, "vm-archive-helper-builder", {"disk_id": disk["id"]})
+        config = create_config(api, builder_id, "vm-archive-builder", {"disk_id": disk["id"]})
         milestone("Stage 2.1/5: booting the Debian builder and waiting for its SSH endpoint")
         boot(api, builder_id, config["id"], "Debian helper builder")
         builder = api.get(f"/linode/instances/{builder_id}")
@@ -2113,10 +2145,10 @@ def helper_boot_volume(api, c, region):
                       "helper BSV to detach from the builder")
         milestone("Stage 4/5: boot-testing the completed helper BSV on a separate probe")
         probe_started = datetime.now(timezone.utc)
-        probe = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"vm-archive-helper-probe-{int(time.time())}"})
+        probe = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"vm-archive-probe-{int(time.time())}"})
         probe_id = probe["id"]
         probe = wait_for_linode_create(api, probe_id, probe_started, "helper probe Linode")
-        probe_cfg = create_config(api, probe_id, "vm-archive-helper-probe", {"volume_id": volume["id"]}, kernel="linode/grub2")
+        probe_cfg = create_config(api, probe_id, "vm-archive-probe", {"volume_id": volume["id"]}, kernel="linode/grub2")
         boot(api, probe_id, probe_cfg["id"], "helper BSV probe")
         probe = api.get(f"/linode/instances/{probe['id']}")
         wait_ssh(c, probe["ipv4"][0], "portable helper BSV")
