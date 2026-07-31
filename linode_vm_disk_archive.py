@@ -1689,12 +1689,16 @@ def main():
     elif args.command=="verify-archive": verify_archive_bsv(api,c)
     elif args.command=="prepare-bsv-helper": prepare_bsv_helper(api,c)
 
-READY_TAG = "cold-archive-helper-v1"
-BUILDING_TAG = "cold-archive-helper-building-v1"
+READY_TAG = "vm-archive-helper-v1"
+BUILDING_TAG = "vm-archive-helper-building-v1"
 # B8's independently boot-tested helper uses the same worker protocol as v1.0.
 # Keep this compatibility list explicit: a future release may reuse a prior
 # helper only after its worker protocol has been deliberately verified.
-COMPATIBLE_HELPER_READY_TAGS = (READY_TAG, "cold-archive-helper-b1")
+COMPATIBLE_HELPER_READY_TAGS = (
+    READY_TAG,
+    "cold-archive-helper-v1",
+    "cold-archive-helper-b1",
+)
 
 # This runs only on the disposable, ordinary Debian builder.  It waits for the
 # controller to attach the blank target BSV, then installs an independent OS
@@ -1809,7 +1813,7 @@ progress complete
 '''
 
 def ensure_helper_builder_stackscript(api, c):
-    label = c.get("helper_builder_stackscript_label", "linode-cold-archive-built-helper-v1")
+    label = c.get("helper_builder_stackscript_label", "linode-vm-archive-built-helper-v1")
     stacks = api.get("/linode/stackscripts?page=1&page_size=100")["data"]
     matches = [s for s in stacks if s["label"] == label]
     if matches:
@@ -1821,7 +1825,7 @@ def ensure_helper_builder_stackscript(api, c):
         return current["id"]
     return api.post("/linode/stackscripts", {
         "label": label,
-        "description": "Builds the cold-archive helper BSV directly from Debian.",
+        "description": "Builds the VM archive helper BSV directly from Debian.",
         "images": [c["helper_image"]], "is_public": False, "script": BUILDER_STACKSCRIPT,
     })["id"]
 
@@ -2048,7 +2052,7 @@ def helper_boot_volume(api, c, region):
         if v.get("region") == region and any(tag in COMPATIBLE_HELPER_READY_TAGS for tag in v.get("tags", []))
     ]
     if len(existing) > 1:
-        raise RuntimeError(f"Multiple compatible cold-archive helper BSVs exist in {region}: " + ", ".join(str(v["id"]) for v in existing) + ". Keep one before retrying.")
+        raise RuntimeError(f"Multiple compatible VM archive helper BSVs exist in {region}: " + ", ".join(str(v["id"]) for v in existing) + ". Keep one before retrying.")
     if existing:
         matched = next(tag for tag in existing[0].get("tags", []) if tag in COMPATIBLE_HELPER_READY_TAGS)
         if matched != READY_TAG:
@@ -2057,7 +2061,7 @@ def helper_boot_volume(api, c, region):
     # Linode volume labels are limited to 32 characters. This concise form
     # remains deterministic and fits even a long region ID such as
     # ``us-southeast`` (exactly 32 characters).
-    helper_label = derived_volume_label("cold-archive-helper", f"-{region}")
+    helper_label = derived_volume_label("vm-archive-helper", f"-{region}")
     label_conflicts = [v for v in volumes if v.get("region") == region and v.get("label") == helper_label]
     if label_conflicts:
         conflict = label_conflicts[0]
@@ -2066,7 +2070,7 @@ def helper_boot_volume(api, c, region):
             f"with tags {conflict.get('tags', [])}. It is missing a recognized ready tag "
             f"({', '.join(COMPATIBLE_HELPER_READY_TAGS)}). Confirm that it is a boot-tested compatible helper "
             "before adding a recognized tag manually; otherwise delete it, then retry. "
-            "Version 1.0 will not retag, replace, or reuse an unknown helper BSV."
+            "The tool will not retag, replace, or reuse an unknown helper BSV."
         )
     size = int(c.get("helper_boot_volume_gb", 10))
     print(
@@ -2087,15 +2091,15 @@ def helper_boot_volume(api, c, region):
         builder_type = types[0]["id"]
         milestone(f"Stage 2/5: creating disposable {builder_type} Debian builder")
         started = datetime.now(timezone.utc)
-        builder = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"cold-archive-helper-builder-{int(time.time())}"})
+        builder = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"vm-archive-helper-builder-{int(time.time())}"})
         builder_id = builder["id"]
         builder = wait_for_linode_create(api, builder_id, started, "helper builder Linode")
         disk = post_when_linode_ready(api, f"/linode/instances/{builder_id}/disks", {
-            "label": "cold-archive-helper-builder", "size": 4096, "image": c["helper_image"],
+            "label": "vm-archive-helper-builder", "size": 4096, "image": c["helper_image"],
             "authorized_keys": [c["helper_ssh_public_key"]], "stackscript_id": stack,
             "stackscript_data": {"TARGET_VOLUME_LABEL": volume["label"]},
         }, "create the helper builder disk")
-        config = create_config(api, builder_id, "cold-archive-helper-builder", {"disk_id": disk["id"]})
+        config = create_config(api, builder_id, "vm-archive-helper-builder", {"disk_id": disk["id"]})
         milestone("Stage 2.1/5: booting the Debian builder and waiting for its SSH endpoint")
         boot(api, builder_id, config["id"], "Debian helper builder")
         builder = api.get(f"/linode/instances/{builder_id}")
@@ -2110,10 +2114,10 @@ def helper_boot_volume(api, c, region):
                       "helper BSV to detach from the builder")
         milestone("Stage 4/5: boot-testing the completed helper BSV on a separate probe")
         probe_started = datetime.now(timezone.utc)
-        probe = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"cold-archive-helper-probe-{int(time.time())}"})
+        probe = api.post("/linode/instances", {"region": region, "type": builder_type, "label": f"vm-archive-helper-probe-{int(time.time())}"})
         probe_id = probe["id"]
         probe = wait_for_linode_create(api, probe_id, probe_started, "helper probe Linode")
-        probe_cfg = create_config(api, probe_id, "cold-archive-helper-probe", {"volume_id": volume["id"]}, kernel="linode/grub2")
+        probe_cfg = create_config(api, probe_id, "vm-archive-helper-probe", {"volume_id": volume["id"]}, kernel="linode/grub2")
         boot(api, probe_id, probe_cfg["id"], "helper BSV probe")
         probe = api.get(f"/linode/instances/{probe['id']}")
         wait_ssh(c, probe["ipv4"][0], "portable helper BSV")
