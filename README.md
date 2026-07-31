@@ -35,9 +35,9 @@ filesystem and local disk, and archives the smaller disk. After a successful
 archive, the source is restored to its original disk allocation and filesystem
 size unless `--delete-source` was explicitly requested.
 
-The archive BSV is rounded up to Linode's whole-GB increment, with a 10 GB
-minimum. The source disk also receives a small raw-device cushion after ext4
-allocation-group alignment, so the measured compact filesystem always fits.
+The compact source disk and archive BSV are rounded up to Linode's whole-GB
+increment, with a 10 GB minimum. A small raw-device cushion is added when a
+compact archive is restored to a newly created local disk.
 
 Windows, partitioned roots, and unsupported filesystems are never shrunk. The
 tool explains why, creates no archive, and leaves the source unchanged. Rerun

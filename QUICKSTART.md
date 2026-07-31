@@ -74,8 +74,9 @@ adds a 4 GB safety buffer, and creates the smallest supported archive BSV.
 After verification, the source root disk and filesystem return to their
 original size and the source remains powered off.
 
-Archive BSVs are rounded up to whole GB, with a 10 GB minimum. The compact
-source disk includes a small raw-device cushion after ext4 alignment.
+Compact source disks and archive BSVs are rounded up to whole GB, with a 10 GB
+minimum. A small raw-device cushion is added when restoring to a newly created
+local disk.
 
 If you explicitly want a full-size archive, add `--resize original`:
 

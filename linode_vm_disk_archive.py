@@ -329,15 +329,14 @@ estimate=$(resize2fs -P "$source" 2>&1) || { printf '{"ok":true,"supported":fals
 minimum_blocks=$(printf '%s\n' "$estimate" | sed -n 's/.*: \([0-9][0-9]*\)$/\1/p' | tail -n 1)
 block_size=$(tune2fs -l "$source" 2>/dev/null | awk -F: '/^Block size:/{gsub(/ /,"",$2); print $2}')
 block_count=$(tune2fs -l "$source" 2>/dev/null | awk -F: '/^Block count:/{gsub(/ /,"",$2); print $2}')
-blocks_per_group=$(tune2fs -l "$source" 2>/dev/null | awk -F: '/^Blocks per group:/{gsub(/ /,"",$2); print $2}')
 uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
 [ -n "$uuid" ] || fail "could not parse ext4 filesystem UUID"
-case "$minimum_blocks:$block_size:$block_count:$blocks_per_group" in
+case "$minimum_blocks:$block_size:$block_count" in
   *[!0-9:]*|::*|:*|*:) fail "could not parse numeric ext4 block metrics" ;;
 esac
 minimum_bytes=$((minimum_blocks * block_size))
 filesystem_bytes=$((block_count * block_size))
-printf '{"ok":true,"supported":true,"source_device":"%s","raw_bytes":%s,"filesystem":"ext4","layout":"whole-device","ext4_uuid":"%s","ext4_block_size":%s,"ext4_block_count":%s,"ext4_blocks_per_group":%s,"ext4_filesystem_bytes":%s,"ext4_minimum_blocks":%s,"ext4_minimum_bytes":%s}\n' "$source" "$raw_bytes" "$uuid" "$block_size" "$block_count" "$blocks_per_group" "$filesystem_bytes" "$minimum_blocks" "$minimum_bytes"'''
+printf '{"ok":true,"supported":true,"source_device":"%s","raw_bytes":%s,"filesystem":"ext4","layout":"whole-device","ext4_uuid":"%s","ext4_block_size":%s,"ext4_block_count":%s,"ext4_filesystem_bytes":%s,"ext4_minimum_blocks":%s,"ext4_minimum_bytes":%s}\n' "$source" "$raw_bytes" "$uuid" "$block_size" "$block_count" "$filesystem_bytes" "$minimum_blocks" "$minimum_bytes"'''
     result = ssh(c, ip, f"/bin/bash -c {shlex.quote(inspector)} -- {shlex.quote(helper_volume_label)}")
     if result.returncode != 0:
         raise RuntimeError("Resize inspection SSH command failed: " + (result.stderr.strip() or result.stdout.strip()))
@@ -425,10 +424,9 @@ def plan_resize(api, c):
         sizes = compact_resize_sizes(inspection)
         inspection["ext4_minimum_mb"] = sizes["ext4_minimum_mb"]
         inspection["requested_ext4_shrink_mb"] = sizes["requested_filesystem_mb"]
-        inspection["estimated_aligned_ext4_mb"] = sizes["estimated_aligned_filesystem_mb"]
-        inspection["estimated_compact_root_mb"] = sizes["estimated_compact_api_mb"]
+        inspection["compact_root_mb"] = sizes["compact_api_mb"]
         inspection["provider_minimum_bsv_gb"] = MINIMUM_BSV_SIZE_GB
-        inspection["estimated_archive_bsv_gb"] = sizes["estimated_archive_bsv_gb"]
+        inspection["archive_bsv_gb"] = sizes["archive_bsv_gb"]
         milestone("Resize qualification passed; no filesystem changes were made")
     else:
         milestone("Resize qualification did not support this root layout; no filesystem changes were made")
@@ -533,6 +531,13 @@ def minimum_restore_allocation_mb(m):
         return original
     return source_mb + LOCAL_DISK_CUSHION_MB
 
+def compact_minimum_restore_allocation_mb(m):
+    """Return a safe new-local-disk allocation for a compact archive payload."""
+    # The archived raw device can be exactly the compact source allocation,
+    # while a newly created target disk may expose less raw capacity. Always
+    # reserve the normal new-disk cushion beyond the actual copied bytes.
+    return math.ceil(int(m["source_bytes"]) / (1024 * 1024)) + LOCAL_DISK_CUSHION_MB
+
 def choose_restore_disk_size(c, m):
     """Choose the target allocation before filtering eligible final plans.
 
@@ -548,7 +553,7 @@ def choose_restore_disk_size(c, m):
         c["restore_disk_mb"] = original_mb
         c["restore_size_mode"] = "original"
         return original_mb
-    compact_mb = int(resize["compact_api_mb"])
+    compact_mb = compact_minimum_restore_allocation_mb(m)
     requested = c.get("restore_size")
     if requested not in (None, "original", "min", "custom"):
         raise RuntimeError("--restore-size must be original, min, or custom.")
@@ -582,7 +587,7 @@ def choose_custom_restore_size(c, m, final_plan):
     """Choose a compact-archive target after the operator knows the plan."""
     if c.get("restore_size_mode") != "custom":
         return int(c["restore_disk_mb"])
-    minimum_mb = int(m["resize"]["compact_api_mb"])
+    minimum_mb = compact_minimum_restore_allocation_mb(m)
     swap_mb = int((m.get("swap") or {}).get("size_mb", 0))
     maximum_mb = int(final_plan["disk"]) - swap_mb
     if maximum_mb < minimum_mb:
@@ -985,34 +990,16 @@ def compact_resize_sizes(inspection):
     size the compact local disk and whole-GB archive BSV.
     """
     minimum_mb = math.ceil(int(inspection["ext4_minimum_bytes"]) / (1024 * 1024))
-    block_size = int(inspection["ext4_block_size"])
-    blocks_per_group = int(inspection["ext4_blocks_per_group"])
     requested_filesystem_mb = minimum_mb + RESIZE_SAFETY_BUFFER_MB
-    requested_blocks = math.ceil(requested_filesystem_mb * 1024 * 1024 / block_size)
-    aligned_blocks = math.ceil(requested_blocks / blocks_per_group) * blocks_per_group
-    aligned_filesystem_bytes = aligned_blocks * block_size
-    final_sizes = compact_disk_sizes_from_filesystem(aligned_filesystem_bytes)
+    compact_api_mb = max(
+        MINIMUM_BSV_SIZE_GB * 1024,
+        math.ceil(requested_filesystem_mb / 1024) * 1024,
+    )
     return {
         "ext4_minimum_mb": minimum_mb,
         "requested_filesystem_mb": requested_filesystem_mb,
-        "estimated_aligned_filesystem_mb": final_sizes["compact_filesystem_mb"],
-        "estimated_compact_api_mb": final_sizes["compact_api_mb"],
-        "estimated_archive_bsv_gb": final_sizes["archive_bsv_gb"],
-    }
-
-def compact_disk_sizes_from_filesystem(filesystem_bytes):
-    """Size a compact source disk and BSV from the actual resized ext4 size."""
-    filesystem_mb = math.ceil(int(filesystem_bytes) / (1024 * 1024))
-    # A locally resized disk can expose up to 16 MiB less raw capacity than
-    # requested. Use the established 32 MiB cushion so the measured ext4
-    # filesystem always fits. The BSV itself is then rounded up to its whole
-    # GB provider increment, with the provider's 10 GB minimum.
-    compact_api_mb = filesystem_mb + LOCAL_DISK_CUSHION_MB
-    archive_bsv_gb = max(MINIMUM_BSV_SIZE_GB, math.ceil(compact_api_mb / 1024))
-    return {
-        "compact_filesystem_mb": filesystem_mb,
         "compact_api_mb": compact_api_mb,
-        "archive_bsv_gb": archive_bsv_gb,
+        "archive_bsv_gb": compact_api_mb // 1024,
     }
 
 def reexpand_source_root(api, c, node_id, root, helper, swap_source=None, baseline=None):
@@ -1158,9 +1145,8 @@ def archive_bsv_resize_min(api, c):
             "filesystem_minimum_mb": shrink_target["ext4_minimum_mb"],
             "safety_buffer_mb": RESIZE_SAFETY_BUFFER_MB,
             "requested_ext4_shrink_mb": shrink_target["requested_filesystem_mb"],
-            "estimated_aligned_ext4_mb": shrink_target["estimated_aligned_filesystem_mb"],
-            "estimated_compact_source_disk_mb": shrink_target["estimated_compact_api_mb"],
-            "estimated_archive_bsv_gb": shrink_target["estimated_archive_bsv_gb"],
+            "compact_source_disk_mb": shrink_target["compact_api_mb"],
+            "archive_bsv_gb": shrink_target["archive_bsv_gb"],
             "original_source_disk_mb": root["size"],
         }, indent=2))
         milestone("Checking and shrinking detached source ext4 filesystem")
@@ -1175,15 +1161,16 @@ def archive_bsv_resize_min(api, c):
         )
         if int(post_shrink["ext4_filesystem_bytes"]) < shrink_target["requested_filesystem_mb"] * 1024 * 1024:
             raise RuntimeError("post-shrink source check: ext4 filesystem is smaller than the requested minimum-plus-buffer size.")
-        sizes = compact_disk_sizes_from_filesystem(post_shrink["ext4_filesystem_bytes"])
+        actual_filesystem_mb = math.ceil(int(post_shrink["ext4_filesystem_bytes"]) / (1024 * 1024))
+        sizes = shrink_target
         source_after_verification = (
             "delete the source VM after a final exact confirmation"
             if c.get("delete_source")
             else "restore the source disk and filesystem to their original size"
         )
         milestone(
-            f"Compact size qualified after ext4 alignment: filesystem {sizes['compact_filesystem_mb']} MB; "
-            f"source root {sizes['compact_api_mb']} MB; archive BSV {sizes['archive_bsv_gb']} GB. "
+            f"Compact filesystem prepared: {actual_filesystem_mb} MB; source root {sizes['compact_api_mb']} MB; "
+            f"archive BSV {sizes['archive_bsv_gb']} GB. "
             f"The workflow will now archive, then {source_after_verification}."
         )
         shutdown(api, node["id"])
@@ -1202,7 +1189,6 @@ def archive_bsv_resize_min(api, c):
         validate_resize_root(
             compact_inspection, sizes["compact_api_mb"], "compact source-disk check",
             expected_uuid=inspection["ext4_uuid"],
-            maximum_filesystem_bytes=sizes["compact_filesystem_mb"] * 1024 * 1024,
         )
         swap = None
         if swap_source:
@@ -1456,7 +1442,7 @@ def restore_plan(api, c, m):
     requested_target_mb = choose_custom_restore_size(c, m, p)
     swap_mb = int((m.get("swap") or {}).get("size_mb", 0))
     required_plan_mb = requested_target_mb + swap_mb
-    compact_floor = int((m.get("resize") or {}).get("compact_api_mb", 0))
+    compact_floor = compact_minimum_restore_allocation_mb(m) if m.get("resize") else 0
     if requested_target_mb < (compact_floor or minimum_restore_allocation_mb(m)):
         raise RuntimeError("Requested restore allocation cannot be smaller than the compact archive allocation.")
     eligible, _sources, _account_filtered = restore_candidates(api, volume["region"], required_plan_mb)
@@ -1476,7 +1462,7 @@ def restore_bsv(api, c):
     if m.get("source_plan") and not c.get("restore_plan_explicit"):
         c["restore_plan"] = m["source_plan"]
     target_mb = math.ceil(int(m["source_bytes"]) / (1024 * 1024))
-    compact_floor = int((m.get("resize") or {}).get("compact_api_mb", 0))
+    compact_floor = compact_minimum_restore_allocation_mb(m) if m.get("resize") else 0
     validate_linode_label(c["restore_label"])
     # Build the helper only after all restore choices have been confirmed, but
     # still before creating a billable restored VM.
