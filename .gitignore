@@ -1,0 +1,18 @@
+# Local controller configuration and archive logs
+config.json
+archives/
+history/
+*.log
+*.tmp
+
+# Credentials and private keys
+*.pem
+*.key
+id_*
+!id_*.pub
+
+# Python and operating-system noise
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
